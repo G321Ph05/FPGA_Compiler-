@@ -431,8 +431,8 @@ if [ -f "$SELECTED_SRC" ]; then
     cp "$SELECTED_SRC" "$BUILD_DIR/"
     echo "  Copied: $(basename "$SELECTED_SRC")"
 fi
-# Copy all .v files (dependencies like picorv32.v)
-for vfile in "$SOURCE_DIR"/*.v; do
+# Copy all .v/.sv files (dependencies) to build directory
+for vfile in "$SOURCE_DIR"/*.v "$SOURCE_DIR"/*.sv; do
     VFILE_BASENAME=$(basename "$vfile")
     VFILE_NAME="${VFILE_BASENAME%.*}"
     if [ -f "$vfile" ] && [ "$VFILE_BASENAME" != "$SELECTED_BASENAME" ] && [ "$VFILE_NAME" != "$SELECTED_NAME" ]; then
@@ -455,6 +455,86 @@ fi
 if [ -n "$CONSTRAINTS" ] && [ -f "$CONSTRAINTS" ]; then
     cp "$CONSTRAINTS" "$BUILD_DIR/"
     echo "  Copied: $(basename "$CONSTRAINTS")"
+fi
+
+# Function to convert Vivado XDC to nextpnr-compatible format
+convert_xdc_for_nextpnr() {
+    local xdc_file="$1"
+    local temp_file="${xdc_file}.tmp"
+    
+    # Check if file contains -dict syntax (Vivado format)
+    if grep -q 'set_property -dict' "$xdc_file" 2>/dev/null; then
+        echo "  Converting XDC from Vivado to nextpnr format..."
+        
+        # Process each line
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip empty lines and comments
+            if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+                echo "$line"
+                continue
+            fi
+            
+            # Check if this is a -dict line
+            if [[ "$line" =~ ^[[:space:]]*set_property[[:space:]]+-dict[[:space:]]+\{(.+)\}[[:space:]]+\[get_ports[[:space:]]+\{(.+)\}\][[:space:]]*$ ]]; then
+                # Extract dict content and port name
+                dict_content="${BASH_REMATCH[1]}"
+                port_name="${BASH_REMATCH[2]}"
+                
+                # Remove spaces inside braces: { a } -> {a}
+                port_name=$(echo "$port_name" | tr -d ' ')
+                
+                # Parse PACKAGE_PIN and IOSTANDARD from dict
+                package_pin=""
+                iostandard=""
+                
+                # Extract each key-value pair
+                while [[ "$dict_content" =~ ([A-Z_]+)[[:space:]]+([^[:space:}]]+) ]]; do
+                    key="${BASH_REMATCH[1]}"
+                    value="${BASH_REMATCH[2]}"
+                    
+                    case "$key" in
+                        PACKAGE_PIN)
+                            package_pin="$value"
+                            ;;
+                        IOSTANDARD)
+                            iostandard="$value"
+                            ;;
+                    esac
+                    
+                    # Remove parsed part from dict_content
+                    dict_content="${dict_content#${BASH_REMATCH[0]}}"
+                done
+                
+                # Generate two lines (nextpnr format)
+                if [ -n "$package_pin" ]; then
+                    echo "set_property PACKAGE_PIN $package_pin [get_ports {$port_name}]"
+                fi
+                if [ -n "$iostandard" ]; then
+                    echo "set_property IOSTANDARD $iostandard [get_ports {$port_name}]"
+                fi
+            else
+                # Remove spaces inside braces for non-dict lines too
+                # e.g., [get_ports { a }] -> [get_ports {a}]
+                line=$(echo "$line" | sed 's/{[[:space:]]*\([^}]*\)[[:space:]]*}/{ \1 }/g' | tr -d ' ')
+                line=$(echo "$line" | sed 's/{ \([^{}]*\) }/{\1}/g')
+                echo "$line"
+            fi
+        done < "$xdc_file" > "$temp_file"
+        
+        mv "$temp_file" "$xdc_file"
+        echo "  XDC converted successfully"
+    else
+        # Just fix spacing issues in regular XDC files
+        if grep -q '\[get_ports[[:space:]]*{[[:space:]]' "$xdc_file" 2>/dev/null; then
+            echo "  Fixing port name spacing in XDC..."
+            sed -i 's/\[get_ports[[:space:]]*{[[:space:]]*\([^}]*\)[[:space:]]*}\]/[get_ports {\1}]/g' "$xdc_file"
+        fi
+    fi
+}
+
+# Convert XDC if needed (after copying to build dir)
+if [ -n "$CONSTRAINTS" ] && [ -f "$BUILD_DIR/$(basename "$CONSTRAINTS")" ]; then
+    convert_xdc_for_nextpnr "$BUILD_DIR/$(basename "$CONSTRAINTS")"
 fi
 
 # Function to cleanup on exit
@@ -492,13 +572,17 @@ echo ""
 
 echo -e "${YELLOW}Step 1: Synthesis with Yosys${NC}"
 
-# Build yosys command to read selected source file and any .v dependencies
+# Build yosys command to read selected source file and any .v/.sv dependencies
 SELECTED_BASENAME=$(basename "$SELECTED_SRC")
 SELECTED_NAME="${SELECTED_BASENAME%.*}"
 V_FILES=$(ls -1 *.v 2>/dev/null | grep -v -E '^(tb_.*|.*_tb\.v|sim\.v)$' | grep -v "^${SELECTED_BASENAME}$" | grep -v "^${SELECTED_NAME}.v$" | tr '\n' ' ')
+SV_FILES=$(ls -1 *.sv 2>/dev/null | grep -v -E '^(tb_.*|.*_tb\.sv|sim\.sv)$' | grep -v "^${SELECTED_BASENAME}$" | grep -v "^${SELECTED_NAME}.sv$" | tr '\n' ' ')
 YOSYS_CMD="read_verilog -sv ${SELECTED_BASENAME}"
 if [ -n "$V_FILES" ]; then
     YOSYS_CMD="${YOSYS_CMD}; read_verilog ${V_FILES}"
+fi
+if [ -n "$SV_FILES" ]; then
+    YOSYS_CMD="${YOSYS_CMD}; read_verilog -sv ${SV_FILES}"
 fi
 YOSYS_CMD="${YOSYS_CMD}; hierarchy -check -top ${TOP}; synth_xilinx -family xc7 -top ${TOP}; write_json \"${BUILD_DIR}/${PROJECT}.json\""
 
@@ -550,7 +634,7 @@ echo ""
 nextpnr-xilinx \
     --chipdb "${CHIPDB_FOUND}" \
     --json "${BUILD_DIR}/${PROJECT}.json" \
-    --xdc "${CONSTRAINTS}" \
+    --xdc "${BUILD_DIR}/$(basename "$CONSTRAINTS")" \
     --fasm "${BUILD_DIR}/${PROJECT}.fasm" \
     --verbose 2>&1 | tee ${BUILD_DIR}/nextpnr.log
 
